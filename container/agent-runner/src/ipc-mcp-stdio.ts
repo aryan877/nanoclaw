@@ -11,22 +11,34 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
+// The directory where IPC (Inter-Process Communication) files are written
+// This is mounted to a shared volume with the host machine.
 const IPC_DIR = '/workspace/ipc';
+
+// Subdirectories for different types of outgoing IPC signals
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 
 // Context from environment variables (set by the agent runner)
-const chatJid = process.env.NANOCLAW_CHAT_JID!;
-const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!;
-const isMain = process.env.NANOCLAW_IS_MAIN === '1';
+// These variables tell the MCP server which chat it's currently operating within
+const chatJid = process.env.NANOCLAW_CHAT_JID!; // e.g., '12345@s.whatsapp.net'
+const groupFolder = process.env.NANOCLAW_GROUP_FOLDER!; // e.g., 'my-group'
+const isMain = process.env.NANOCLAW_IS_MAIN === '1'; // true if this is the admin chat
 
+/**
+ * Helper to safely write a JSON file to the host via the IPC mount.
+ * It uses a `.tmp` file and a rename to ensure the host doesn't read a half-written file.
+ */
 function writeIpcFile(dir: string, data: object): string {
+  // Ensure the target directory exists
   fs.mkdirSync(dir, { recursive: true });
 
+  // Generate a unique filename using timestamp and random string
   const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
   const filepath = path.join(dir, filename);
 
-  // Atomic write: temp file then rename
+  // Atomic write: write to a temp file first, then instantly rename it
+  // This prevents the host from crashing by reading incomplete JSON
   const tempPath = `${filepath}.tmp`;
   fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
   fs.renameSync(tempPath, filepath);
@@ -34,11 +46,16 @@ function writeIpcFile(dir: string, data: object): string {
   return filename;
 }
 
+// Initialize the MCP (Model Context Protocol) Server
+// This server provides tools that Claude can call natively
 const server = new McpServer({
   name: 'nanoclaw',
   version: '1.0.0',
 });
 
+// --- TOOL: Send Message ---
+// Allows the AI to send a message *before* it finishes thinking.
+// Normal AI output is only sent when the whole turn is done. This bypasses that.
 server.tool(
   'send_message',
   "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
@@ -47,6 +64,7 @@ server.tool(
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
   },
   async (args) => {
+    // Construct the payload that index.ts expects
     const data: Record<string, string | undefined> = {
       type: 'message',
       chatJid,
@@ -56,12 +74,15 @@ server.tool(
       timestamp: new Date().toISOString(),
     };
 
+    // Write to the IPC directory where index.ts is watching
     writeIpcFile(MESSAGES_DIR, data);
 
     return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
   },
 );
 
+// --- TOOL: Schedule Task ---
+// Allows the AI to set an alarm for itself to wake up in the future and do something.
 server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
@@ -93,7 +114,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
     target_group_jid: z.string().optional().describe('(Main group only) JID of the group to schedule the task for. Defaults to the current group.'),
   },
   async (args) => {
-    // Validate schedule_value before writing IPC
+    // Validate schedule_value before writing IPC to ensure it doesn't crash the host
     if (args.schedule_type === 'cron') {
       try {
         CronExpressionParser.parse(args.schedule_value);
@@ -127,9 +148,11 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       }
     }
 
-    // Non-main groups can only schedule for themselves
+    // Security check: Only the Admin bot (Main Group) can schedule tasks for OTHER groups.
+    // Regular groups can only schedule tasks for themselves.
     const targetJid = isMain && args.target_group_jid ? args.target_group_jid : chatJid;
 
+    // Build the payload
     const data = {
       type: 'schedule_task',
       prompt: args.prompt,
@@ -141,6 +164,7 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
       timestamp: new Date().toISOString(),
     };
 
+    // Send the task request to the host
     const filename = writeIpcFile(TASKS_DIR, data);
 
     return {
@@ -149,11 +173,14 @@ SCHEDULE VALUE FORMAT (all times are LOCAL timezone):
   },
 );
 
+// --- TOOL: List Tasks ---
+// Allows the AI to see what alarms are currently set.
 server.tool(
   'list_tasks',
   "List all scheduled tasks. From main: shows all tasks. From other groups: shows only that group's tasks.",
   {},
   async () => {
+    // The host maintains a JSON file of all active tasks, mounted here
     const tasksFile = path.join(IPC_DIR, 'current_tasks.json');
 
     try {
@@ -161,8 +188,10 @@ server.tool(
         return { content: [{ type: 'text' as const, text: 'No scheduled tasks found.' }] };
       }
 
+      // Read the host's task list
       const allTasks = JSON.parse(fs.readFileSync(tasksFile, 'utf-8'));
 
+      // Security check: Admin can see all tasks, users can only see their own
       const tasks = isMain
         ? allTasks
         : allTasks.filter((t: { groupFolder: string }) => t.groupFolder === groupFolder);
@@ -171,6 +200,7 @@ server.tool(
         return { content: [{ type: 'text' as const, text: 'No scheduled tasks found.' }] };
       }
 
+      // Format them nicely for the AI to read
       const formatted = tasks
         .map(
           (t: { id: string; prompt: string; schedule_type: string; schedule_value: string; status: string; next_run: string }) =>
@@ -187,6 +217,7 @@ server.tool(
   },
 );
 
+// --- TOOL: Pause Task ---
 server.tool(
   'pause_task',
   'Pause a scheduled task. It will not run until resumed.',
@@ -206,6 +237,7 @@ server.tool(
   },
 );
 
+// --- TOOL: Resume Task ---
 server.tool(
   'resume_task',
   'Resume a paused task.',
@@ -225,6 +257,8 @@ server.tool(
   },
 );
 
+// --- TOOL: Cancel Task ---
+// Permanently delete an alarm.
 server.tool(
   'cancel_task',
   'Cancel and delete a scheduled task.',
@@ -244,6 +278,8 @@ server.tool(
   },
 );
 
+// --- TOOL: Register Group ---
+// Allows the Admin to whitelist a new WhatsApp group so the AI will talk to it.
 server.tool(
   'register_group',
   `Register a new WhatsApp group so the agent can respond to messages there. Main group only.
@@ -256,6 +292,7 @@ Use available_groups.json to find the JID for a group. The folder name should be
     trigger: z.string().describe('Trigger word (e.g., "@Andy")'),
   },
   async (args) => {
+    // Only the main admin chat can authorize new groups
     if (!isMain) {
       return {
         content: [{ type: 'text' as const, text: 'Only the main group can register new groups.' }],
@@ -272,6 +309,7 @@ Use available_groups.json to find the JID for a group. The folder name should be
       timestamp: new Date().toISOString(),
     };
 
+    // Send the authorization request to the host
     writeIpcFile(TASKS_DIR, data);
 
     return {
@@ -280,6 +318,6 @@ Use available_groups.json to find the JID for a group. The folder name should be
   },
 );
 
-// Start the stdio transport
+// Start the stdio transport so Claude SDK can communicate with this MCP server
 const transport = new StdioServerTransport();
 await server.connect(transport);
